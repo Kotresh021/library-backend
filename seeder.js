@@ -1,70 +1,47 @@
 import mongoose from 'mongoose';
-import dotenv from 'dotenv';
 import bcrypt from 'bcryptjs';
-import User from './models/User.js';
-import connectDB from './config/db.js';
+import User from './models/User.js'; // Ensure this path matches your User model
 
-// Load env vars
-dotenv.config();
+// 👇 PASTE YOUR MONGODB ATLAS CONNECTION STRING HERE
+// (The one that looks like: mongodb+srv://admin:password@cluster...)
+const MONGO_URI = "mongodb+srv://GPTKampli:KbhOG69CVT5w0AK4@clusterlms.cblwjgx.mongodb.net/?appName=ClusterLMS";
 
-// Connect to DB
-connectDB();
-
-const importData = async () => {
+const createAdmin = async () => {
     try {
-        // 1. Check if an admin already exists to prevent duplicates
-        const existingAdmin = await User.findOne({ role: 'admin' });
+        await mongoose.connect(MONGO_URI);
+        console.log("✅ Connected to MongoDB Atlas...");
 
+        // 1. Check if admin already exists
+        const existingAdmin = await User.findOne({ email: "admin@gmail.com" });
         if (existingAdmin) {
-            console.log('⚠️ Admin already exists. Seeding skipped.');
+            console.log("⚠️ Admin already exists!");
             process.exit();
         }
 
-        // 2. Hash the password (REQUIRED because authController compares hashes)
+        // 2. Hash Password
         const salt = await bcrypt.genSalt(10);
-        // Change 'admin123' to whatever default password you want
-        const hashedPassword = await bcrypt.hash('admin123', salt);
+        const hashedPassword = await bcrypt.hash("123456", salt);
 
-        // 3. Define Admin Object
-        const adminUser = {
-            name: 'Super Admin',
-            email: 'admin@gmail.com', // Default Email
+        // 3. Create Admin
+        const adminUser = new User({
+            name: "Super Admin",
+            email: "admin@gmail.com",
             password: hashedPassword,
-            role: 'admin',
-            isActive: true,
-            isFirstLogin: false, // Set to false so they aren't prompted to change pass immediately
-            department: 'Administration'
-        };
+            role: "admin",
+            registerNumber: "ADMIN01", // Dummy value to pass validation
+            department: "Library"      // Dummy value
+        });
 
-        // 4. Insert into DB
-        await User.create(adminUser);
+        await adminUser.save();
+        console.log("🎉 SUCCESS! Admin Created.");
+        console.log("📧 Email: admin@gmail.com");
+        console.log("🔑 Password: 123456");
 
-        console.log('✅ Admin User Imported Successfully!');
-        console.log('📧 Email: admin@gmail.com');
-        console.log('🔑 Password: admin123');
-
-        process.exit();
     } catch (error) {
-        console.error(`❌ Error: ${error.message}`);
-        process.exit(1);
+        console.error("❌ Error:", error);
+    } finally {
+        mongoose.disconnect();
     }
 };
 
-const destroyData = async () => {
-    try {
-        // Optional: clear all users (Use with caution)
-        await User.deleteMany();
-        console.log('🔴 Data Destroyed!');
-        process.exit();
-    } catch (error) {
-        console.error(`❌ Error: ${error.message}`);
-        process.exit(1);
-    }
-};
-
-// Handle command line arguments
-if (process.argv[2] === '-d') {
-    destroyData();
-} else {
-    importData();
-}
+createAdmin();

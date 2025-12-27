@@ -1,8 +1,36 @@
 import Book from '../models/Book.js';
 import BookCopy from '../models/BookCopy.js';
-import Department from '../models/Department.js'; // ✅ Required for validation
+import Department from '../models/Department.js';
 import csv from 'csv-parser';
 import fs from 'fs';
+
+// --- HELPER: GENERATE UNIQUE COPIES (The Fix) ---
+// This function finds available slots (holes) or appends to the end
+const generateUniqueCopies = async (bookId, isbn, startFrom, quantity) => {
+    const copies = [];
+    let added = 0;
+    let iterator = 1;
+
+    while (added < quantity) {
+        // Calculate candidate number
+        const candidateNum = `${isbn}-${startFrom + iterator}`;
+
+        // Check if this specific copy ID already exists in DB
+        const exists = await BookCopy.findOne({ copyNumber: candidateNum });
+
+        if (!exists) {
+            copies.push({
+                book: bookId,
+                copyNumber: candidateNum,
+                status: 'Available'
+            });
+            added++;
+        }
+        // If exists, we just increment iterator and try the next number
+        iterator++;
+    }
+    return copies;
+};
 
 // --- CREATE BOOK (Single) ---
 export const createBook = async (req, res) => {
@@ -26,16 +54,13 @@ export const createBook = async (req, res) => {
         });
         await newBook.save();
 
-        // 4. Generate Copies
-        const copies = [];
-        for (let i = 1; i <= quantity; i++) {
-            copies.push({
-                book: newBook._id,
-                copyNumber: `${isbn}-${i}`, // e.g., 978-123-1
-                status: 'Available'
-            });
+        // 4. Generate Copies (Safe Check)
+        // Even for new books, we use the safe generator just in case of orphan data
+        const copies = await generateUniqueCopies(newBook._id, isbn, 0, quantity);
+
+        if (copies.length > 0) {
+            await BookCopy.insertMany(copies);
         }
-        await BookCopy.insertMany(copies);
 
         res.status(201).json(newBook);
     } catch (error) {
@@ -57,8 +82,6 @@ export const getBooks = async (req, res) => {
 export const updateBook = async (req, res) => {
     try {
         const { title, author, department } = req.body;
-
-        // Validate Dept if it's being changed
         if (department) {
             const validDept = await Department.findOne({ code: department });
             if (!validDept) return res.status(400).json({ message: "Invalid Department Code" });
@@ -71,44 +94,33 @@ export const updateBook = async (req, res) => {
     }
 };
 
-// --- DELETE BOOK (Single) + CASCADE DELETE COPIES ---
+// --- DELETE BOOK ---
 export const deleteBook = async (req, res) => {
     try {
         const bookId = req.params.id;
-
-        // 1. Delete all copies associated with this book
-        await BookCopy.deleteMany({ book: bookId }); // ✅ Fixed: Deletes copies
-
-        // 2. Delete the book itself
+        await BookCopy.deleteMany({ book: bookId });
         await Book.findByIdAndDelete(bookId);
-
         res.json({ message: "Book and all its copies deleted" });
     } catch (error) {
         res.status(500).json({ message: error.message });
     }
 };
 
-// --- BULK DELETE BOOKS + CASCADE DELETE COPIES ---
+// --- BULK DELETE BOOKS ---
 export const bulkDeleteBooks = async (req, res) => {
     try {
         const { bookIds } = req.body;
-        if (!bookIds || bookIds.length === 0) {
-            return res.status(400).json({ message: "No books selected" });
-        }
+        if (!bookIds || bookIds.length === 0) return res.status(400).json({ message: "No books selected" });
 
-        // 1. Delete all copies for these books
-        await BookCopy.deleteMany({ book: { $in: bookIds } }); // ✅ Fixed
-
-        // 2. Delete the books
+        await BookCopy.deleteMany({ book: { $in: bookIds } });
         await Book.deleteMany({ _id: { $in: bookIds } });
-
         res.status(200).json({ message: `${bookIds.length} books and their copies deleted.` });
     } catch (error) {
         res.status(500).json({ message: "Bulk delete failed", error: error.message });
     }
 };
 
-// --- UPLOAD CSV (With Validation) ---
+// --- UPLOAD CSV (Robust) ---
 export const uploadBookCSV = async (req, res) => {
     if (!req.file) return res.status(400).json({ message: "No file uploaded" });
 
@@ -117,7 +129,6 @@ export const uploadBookCSV = async (req, res) => {
     let addedCount = 0;
     let updatedCount = 0;
 
-    // 1. Fetch Valid Departments first for quick lookup
     const allDepts = await Department.find();
     const validDeptCodes = allDepts.map(d => d.code.toUpperCase());
 
@@ -126,98 +137,62 @@ export const uploadBookCSV = async (req, res) => {
         .on('data', (data) => results.push(data))
         .on('end', async () => {
             for (const row of results) {
-                // Normalize Keys (handle case sensitivity)
                 const title = row.Title || row.title;
                 const author = row.Author || row.author;
                 const isbn = row.ISBN || row.isbn;
-                const dept = row.Department || row.department; // Expecting Code (e.g. "CSE")
+                const dept = row.Department || row.department;
                 const quantity = parseInt(row.Quantity || row.quantity || 1);
 
-                // --- VALIDATION CHECKS ---
-
-                // Check 1: Missing Basic Fields
                 if (!isbn || !title) {
                     errors.push(`Row missing ISBN or Title`);
                     continue;
                 }
 
-                // Check 2: Validate Department (CRITICAL FIX)
-                // If dept is missing or not in our list of codes
                 if (!dept || !validDeptCodes.includes(dept.toUpperCase())) {
-                    errors.push(`ISBN ${isbn}: Invalid or Missing Department '${dept}'. Please add Dept first.`);
-                    continue; // 🛑 Stop here. Do not try to save.
+                    errors.push(`ISBN ${isbn}: Invalid/Missing Department '${dept}'.`);
+                    continue;
                 }
 
                 try {
                     let book = await Book.findOne({ isbn });
+                    let isNew = false;
 
                     if (book) {
-                        // UPDATE EXISTING
-                        // Optionally update title/author if needed
                         updatedCount++;
                     } else {
-                        // CREATE NEW
+                        isNew = true;
                         book = new Book({
-                            title,
-                            author,
-                            isbn,
+                            title, author, isbn,
                             department: dept.toUpperCase(),
-                            totalCopies: 0, // Will increase below
+                            totalCopies: 0,
                             availableCopies: 0
                         });
                         await book.save();
                         addedCount++;
                     }
 
-                    // GENERATE COPIES (Safely)
-                    const copiesToInsert = [];
-                    // Start from current total + 1
-                    let startCopyNum = book.totalCopies + 1;
-
-                    for (let i = 0; i < quantity; i++) {
-                        const copyNumString = `${isbn}-${startCopyNum + i}`;
-
-                        // Double check if this specific copy ID exists (to prevent E11000)
-                        const exists = await BookCopy.findOne({ copyNumber: copyNumString });
-                        if (!exists) {
-                            copiesToInsert.push({
-                                book: book._id,
-                                copyNumber: copyNumString,
-                                status: 'Available'
-                            });
-                        }
-                    }
+                    // Safe Copy Generation
+                    // We pass book.totalCopies as the starting point, but the helper will skip collisions
+                    const copiesToInsert = await generateUniqueCopies(book._id, isbn, book.totalCopies, quantity);
 
                     if (copiesToInsert.length > 0) {
                         await BookCopy.insertMany(copiesToInsert);
-
-                        // Update Book Counts
                         book.totalCopies += copiesToInsert.length;
                         book.availableCopies += copiesToInsert.length;
                         await book.save();
                     }
 
                 } catch (err) {
-                    // Catch duplicate key errors if they still slip through
-                    if (err.code === 11000) {
-                        errors.push(`ISBN ${isbn}: Duplicate Entry Detected (ISBN or Copy Number)`);
-                    } else {
-                        errors.push(`ISBN ${isbn}: ${err.message}`);
-                    }
+                    errors.push(`ISBN ${isbn}: ${err.message}`);
                 }
             }
 
-            fs.unlinkSync(req.file.path); // Clean up file
-            res.json({
-                message: "Process Complete",
-                added: addedCount,
-                updated: updatedCount,
-                errors
-            });
+            fs.unlinkSync(req.file.path);
+            res.json({ message: "Process Complete", added: addedCount, updated: updatedCount, errors });
         });
 };
 
-// --- COPY MANAGEMENT CONTROLLERS ---
+// --- COPY MANAGEMENT ---
 export const getBookCopies = async (req, res) => {
     try {
         const copies = await BookCopy.find({ book: req.params.bookId });
@@ -227,32 +202,34 @@ export const getBookCopies = async (req, res) => {
     }
 };
 
+// ✅ FIX: "Smart" Add Copies
 export const addCopies = async (req, res) => {
     try {
-        const { bookId, count } = req.body;
+        const { bookId, count, quantity } = req.body;
+        const amountToAdd = parseInt(quantity || count);
+
+        if (!amountToAdd || isNaN(amountToAdd) || amountToAdd < 1) {
+            return res.status(400).json({ message: "Invalid quantity provided" });
+        }
+
         const book = await Book.findById(bookId);
         if (!book) return res.status(404).json({ message: "Book not found" });
 
-        const copies = [];
-        let startNum = book.totalCopies + 1;
+        // Use the smart helper to find free slots
+        const copies = await generateUniqueCopies(book._id, book.isbn, book.totalCopies, amountToAdd);
 
-        for (let i = 0; i < count; i++) {
-            copies.push({
-                book: book._id,
-                copyNumber: `${book.isbn}-${startNum + i}`,
-                status: 'Available'
-            });
+        if (copies.length > 0) {
+            await BookCopy.insertMany(copies);
+
+            // Update counts
+            book.totalCopies = (book.totalCopies || 0) + copies.length;
+            book.availableCopies = (book.availableCopies || 0) + copies.length;
+            await book.save();
         }
 
-        await BookCopy.insertMany(copies);
-
-        // Update counts
-        book.totalCopies += count;
-        book.availableCopies += count;
-        await book.save();
-
-        res.json({ message: `${count} Copies Added` });
+        res.json({ message: `${copies.length} Copies Added` });
     } catch (error) {
+        console.error("Add Copies Error:", error);
         res.status(500).json({ message: error.message });
     }
 };
@@ -263,14 +240,12 @@ export const deleteCopy = async (req, res) => {
         if (!copy) return res.status(404).json({ message: "Copy not found" });
 
         const book = await Book.findById(copy.book);
-
         await BookCopy.findByIdAndDelete(req.params.id);
 
-        // Update Book Counts
         if (book) {
-            book.totalCopies -= 1;
+            book.totalCopies = Math.max(0, book.totalCopies - 1);
             if (copy.status === 'Available') {
-                book.availableCopies -= 1;
+                book.availableCopies = Math.max(0, book.availableCopies - 1);
             }
             await book.save();
         }
@@ -289,9 +264,8 @@ export const updateCopyStatus = async (req, res) => {
 
         const book = await Book.findById(copy.book);
 
-        // Handle Available Logic
         if (copy.status === 'Available' && status !== 'Available') {
-            book.availableCopies -= 1;
+            book.availableCopies = Math.max(0, book.availableCopies - 1);
         } else if (copy.status !== 'Available' && status === 'Available') {
             book.availableCopies += 1;
         }
